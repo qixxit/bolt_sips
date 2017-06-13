@@ -87,11 +87,15 @@ defmodule Bolt.Sips do
     Supervisor.Spec.worker(__MODULE__, [opts])
   end
 
-
   @doc """
   returns a Bolt.Sips.Connection
   """
   defdelegate conn(), to: Connection
+
+  @doc """
+  explicitly closes open a Bolt.Sips.Connection
+  """
+  defdelegate close(conn), to: Connection
 
   ## Query
   ########################
