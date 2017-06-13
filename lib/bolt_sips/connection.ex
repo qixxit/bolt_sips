@@ -5,13 +5,19 @@ defmodule Bolt.Sips.Connection do
 
   NOTE: The use of Poolboy is not correctly implemented and currently
   doesn't work as a pool. Instead it opens a new connection for every
-  call to conn/0 and the connection is never closed.
+  call to conn/0. The connection is then closed automatically when
+  returning the result of a statement or if the caller dies.
+
+  This should be fixed by implementing a pool of GenServers where each
+  GenServer has exactly one connection.
 
   Do not use this module directly. Use the `Bolt.Sips.conn` instead
   """
-  defstruct [:opts]
+  defmodule State do
+     defstruct opts: [], conns: %{}
+  end
 
-  @type t :: %__MODULE__{opts: Keyword.t}
+  @type t :: %State{opts: Keyword.t, conns: %{}}
   @type conn :: GenServer.server | t
 
   use GenServer
@@ -27,10 +33,12 @@ defmodule Bolt.Sips.Connection do
   end
 
   @doc false
-  def handle_call(:connect, _from, opts) do
-    host  = Keyword.fetch!(opts, :hostname) |> to_char_list
-    port  = opts[:port]
-    auth  = opts[:auth]
+  def handle_call(:connect, {caller_pid, _} = from, state) do
+    _ref = Process.monitor(caller_pid)
+
+    host  = Keyword.fetch!(state.opts, :hostname) |> to_char_list
+    port  = state.opts[:port]
+    auth  = state.opts[:auth]
 
     [delay: delay, factor: factor, tries: tries] = Bolt.Sips.config(:retry_linear_backoff)
 
@@ -44,14 +52,16 @@ defmodule Bolt.Sips.Connection do
       end
     end
 
+    new_state = %{state | conns: Map.put(state.conns, caller_pid, p)}
+
     case p do
-      :error -> {:noreply, p, opts}
-      _ -> {:reply, p, opts}
+      :error -> {:noreply, p, new_state}
+      _ -> {:reply, p, new_state}
     end
   end
 
   @doc false
-  def handle_call(data, _from, opts) do
+  def handle_call(data, {caller_pid, _}, state) do
     {s, query, params} = data
 
     [delay: delay, factor: factor, tries: tries] = Bolt.Sips.config(:retry_linear_backoff)
@@ -76,7 +86,12 @@ defmodule Bolt.Sips.Connection do
         end
       end
 
-    {:reply, result, opts}
+    {:reply, result, %{state | conns: maybe_cleanup_conn(caller_pid, state.conns)}}
+  end
+
+  @doc false
+  def handle_info({:DOWN, _caller_ref, :process, caller_pid, reason}, state) do
+    {:noreply, %{state | conns: maybe_cleanup_conn(caller_pid, state.conns)}}
   end
 
   def conn() do
@@ -91,6 +106,23 @@ defmodule Bolt.Sips.Connection do
   # def send(conn, query, params), do: Boltex.Bolt.run_statement(:gen_tcp, conn, query, params)
   def send(cn, query, params), do: pool_server(cn, query, params)
 
+  @doc false
+  def terminate(_reason, _state) do
+    :ok
+  end
+
+  @doc false
+  def init(opts) do
+    auth =
+      if basic_auth = opts[:basic_auth] do
+        {basic_auth[:username], basic_auth[:password]}
+      else
+        {}
+      end
+
+    {:ok, %State{opts: Keyword.put(opts, :auth, auth)}}
+  end
+
   defp pool_server(connection, query, params) do
     :poolboy.transaction(
       Bolt.Sips.pool_name,
@@ -98,23 +130,6 @@ defmodule Bolt.Sips.Connection do
       :infinity
     )
   end
-
-  @doc false
-  def terminate(_reason, _state) do
-    :ok
-  end
-
-  def init(state) do
-    auth =
-      if basic_auth = state[:basic_auth] do
-        {basic_auth[:username], basic_auth[:password]}
-      else
-        {}
-      end
-
-    {:ok, state |> Keyword.put(:auth, auth)}
-  end
-
 
   @doc """
   Logs the given message in debug mode.
@@ -126,7 +141,6 @@ defmodule Bolt.Sips.Connection do
     Logger.debug(message)
   end
 
-
   defp ack_failure(response = %Boltex.Error{}, transport, port) do
     Boltex.Bolt.ack_failure(transport, port, boltex_opts())
     {:error, response}
@@ -134,9 +148,31 @@ defmodule Bolt.Sips.Connection do
   defp ack_failure(non_failure, _, _), do: non_failure
 
   @doc false
-
   defp boltex_opts() do
     [recv_timeout: Bolt.Sips.config(:timeout)]
   end
 
+  defp maybe_cleanup_conn(caller, conns) do
+    case Map.get(conns, caller, nil) do
+      nil ->
+        conns
+      socket ->
+        :ok = close_conn(socket)
+        Map.delete(conns, caller)
+    end
+  end
+
+  defp close_conn(socket) do
+    case Bolt.Sips.config(:ssl) do
+      true ->
+        case Keyword.get(Bolt.Sips.config, :with_etls, false) do
+          true ->
+            :etls.close(socket)
+          false ->
+            :ssl.close(socket)
+        end
+      false ->
+        :gen_tcp.close(socket)
+    end
+  end
 end
