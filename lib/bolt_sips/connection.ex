@@ -5,9 +5,11 @@ defmodule Bolt.Sips.Connection do
 
   Do not use this module directly. Use the `Bolt.Sips.conn` instead
   """
-  defstruct [:opts]
+  defmodule State do
+    defstruct opts: [], conn: nil
+  end
 
-  @type t :: %__MODULE__{opts: Keyword.t}
+  @type t :: %State{opts: Keyword.t, conn: any}
   @type conn :: GenServer.server | t
 
   use GenServer
@@ -23,81 +25,35 @@ defmodule Bolt.Sips.Connection do
   end
 
   @doc false
-  def handle_call(:connect, _from, opts) do
-    host  = Keyword.fetch!(opts, :hostname) |> to_char_list
-    port  = opts[:port]
-    auth  = opts[:auth]
-
-    [delay: delay, factor: factor, tries: tries] = Bolt.Sips.config(:retry_linear_backoff)
-
-    p = retry with: lin_backoff(delay, factor) |> cap(Bolt.Sips.config(:timeout)) |> Stream.take(tries) do
-      case Bolt.Sips.config(:socket).connect(host, port, [active: false, mode: :binary, packet: :raw]) do
-        {:ok, p} ->
-          with :ok <- Boltex.Bolt.handshake(Bolt.Sips.config(:socket), p, boltex_opts()),
-               :ok <- Boltex.Bolt.init(Bolt.Sips.config(:socket), p, auth, boltex_opts()),
-               do: p
-        _ -> :error
-      end
-    end
-
-    case p do
-      :error -> {:noreply, p, opts}
-      _ -> {:reply, p, opts}
-    end
-  end
-
-  @doc false
-  def handle_call(data, _from, opts) do
-    {s, query, params} = data
-
+  # this function handles actual calls to database server
+  def handle_call({statement, params}, _from, state) do
     [delay: delay, factor: factor, tries: tries] = Bolt.Sips.config(:retry_linear_backoff)
     result =
       retry with: lin_backoff(delay, factor) |> cap(Bolt.Sips.config(:timeout)) |> Stream.take(tries) do
         try do
           r =
-            Boltex.Bolt.run_statement(Bolt.Sips.config(:socket), s, query, params, boltex_opts())
-            |> ack_failure(Bolt.Sips.config(:socket), s)
-            log("[#{inspect s}] cypher: #{inspect query} - params: #{inspect params} - bolt: #{inspect r}")
+            Boltex.Bolt.run_statement(Bolt.Sips.config(:socket), state.conn, statement, params, boltex_opts())
+            |> maybe_ack_failure(Bolt.Sips.config(:socket), state.conn)
+          log("[#{inspect state.conn}] cypher: #{inspect statement} - params: #{inspect params} - bolt: #{inspect r}")
           r
         rescue e ->
-          Boltex.Bolt.ack_failure(Bolt.Sips.config(:socket), s, boltex_opts())
-          msg =
-            case e do
-              %Boltex.PackStream.EncodeError{} -> "unable to encode value: #{inspect e.item}"
-              %Boltex.Error{} -> "#{e.message}, type: #{e.type}"
-              _err -> e.message
-            end
-          log("[#{inspect s}] cypher: #{inspect query} - params: #{inspect params} - Error: '#{msg}'. Stacktrace: #{inspect System.stacktrace}")
-          {:failure, %{"code" => :failure, "message" => msg}}
+          Boltex.Bolt.ack_failure(Bolt.Sips.config(:socket), state.conn, boltex_opts())
+          error_msg = parse_error_message(e)
+          log("[#{inspect state.conn}] cypher: #{inspect statement} - params: #{inspect params} - Error: '#{error_msg}'. Stacktrace: #{inspect System.stacktrace}")
+          {:failure, %{"code" => :failure, "message" => error_msg}}
         end
       end
 
-    {:reply, result, opts}
-  end
-
-  def conn() do
-    :poolboy.transaction(
-      Bolt.Sips.pool_name, &(:gen_server.call(&1, :connect, Bolt.Sips.config(:timeout))),
-      :infinity
-    )
+    {:reply, result, state}
   end
 
   @doc false
-  def send(cn, query), do: send(cn, query, %{})
-  # def send(conn, query, params), do: Boltex.Bolt.run_statement(:gen_tcp, conn, query, params)
-  def send(cn, query, params), do: pool_server(cn, query, params)
-
-  defp pool_server(connection, query, params) do
-    :poolboy.transaction(
-      Bolt.Sips.pool_name,
-      &(:gen_server.call(&1, {connection, query, params}, Bolt.Sips.config(:timeout))),
-      :infinity
-    )
-  end
-
-  @doc false
-  def terminate(_reason, _state) do
-    :ok
+  def terminate(_reason, state) do
+    if state.conn != nil do
+      :ok = disconnect(state.conn)
+    else
+      :ok
+    end
   end
 
   def init(state) do
@@ -107,8 +63,11 @@ defmodule Bolt.Sips.Connection do
       else
         {}
       end
+    opts = Keyword.put(state.opts, :auth, auth)
 
-    {:ok, state |> Keyword.put(:auth, auth)}
+    {:ok, conn} = connect(opts)
+
+    {:ok, %State{opts: opts, conn: conn}}
   end
 
 
@@ -122,17 +81,59 @@ defmodule Bolt.Sips.Connection do
     Logger.debug(message)
   end
 
-
-  defp ack_failure(response = %Boltex.Error{}, transport, port) do
+  defp maybe_ack_failure(response = %Boltex.Error{}, transport, port) do
     Boltex.Bolt.ack_failure(transport, port, boltex_opts())
     {:error, response}
   end
-  defp ack_failure(non_failure, _, _), do: non_failure
+  defp maybe_ack_failure(non_failure, _, _), do: non_failure
 
   @doc false
-
   defp boltex_opts() do
     [recv_timeout: Bolt.Sips.config(:timeout)]
+  end
+
+  defp connect(opts) do
+    host  = Keyword.fetch!(opts, :hostname) |> to_char_list
+    port  = opts[:port]
+    auth  = opts[:auth]
+
+    [delay: delay, factor: factor, tries: tries] = Bolt.Sips.config(:retry_linear_backoff)
+
+    retry with: lin_backoff(delay, factor) |> cap(Bolt.Sips.config(:timeout)) |> Stream.take(tries) do
+      case Bolt.Sips.config(:socket).connect(host, port, [active: false, mode: :binary, packet: :raw]) do
+        {:ok, p} ->
+          with :ok <- Boltex.Bolt.handshake(Bolt.Sips.config(:socket), p, boltex_opts()),
+               :ok <- Boltex.Bolt.init(Bolt.Sips.config(:socket), p, auth, boltex_opts()),
+               do: {:ok, p}
+        _ -> :error
+      end
+    end
+  end
+
+  defp disconnect(conn) do
+    case Bolt.Sips.config(:ssl) do
+      true ->
+        case Keyword.get(Bolt.Sips.config, :with_etls, false) do
+          true ->
+            :etls.close(conn)
+          false ->
+            :ssl.close(conn)
+        end
+      false ->
+        :gen_tcp.close(conn)
+    end
+  end
+
+  defp parse_error_message(%Boltex.PackStream.EncodeError{} = error) do
+    "unable to encode value: #{inspect error.item}"
+  end
+
+  defp parse_error_message(%Boltex.Error{} = error) do
+    "#{error.message}, type: #{error.type}"
+  end
+
+  defp parse_error_message(error) do
+    error.message
   end
 
 end

@@ -46,59 +46,20 @@ defmodule Bolt.Sips.Query do
   See the various tests, or more examples and implementation details.
 
   """
-  alias Bolt.Sips.{Connection, Response, Transaction}
 
   @cypher_seps ~r/;(.){0,1}\n/
 
-  def query!(conn, statement),  do: query!(conn,statement, %{})
-  def query!(conn, statement, params) when is_map(params) do
-    case query_commit(conn, statement, params) do
-      {:error, f} ->
-        raise Bolt.Sips.Exception, code: f.code, message: f.message
-      r -> r
-    end
+  def parse_statements([statement]) do
+    statement
   end
-
-  def query(conn, statement), do: query(conn, statement, %{})
-  def query(conn, statement, params) when is_map(params) do
-    case query_commit(conn, statement, params) do
-      {:error, f} -> {:error, code: f.code, message: f.message}
-      r -> {:ok, r}
-    end
-  end
-
-  defp query_commit(conn, statement, params) do
-    statements =
-    String.split(statement, @cypher_seps, trim: true)
+  def parse_statements(statements) do
+    String.split(statements, @cypher_seps, trim: true)
     |> Enum.map(&(String.trim(&1)))
     |> Enum.filter(&(String.length(&1) > 0))
-
-    tx(conn, statements, params)
   end
 
-  defp tx(conn, statements, params) when length(statements) == 1 do
-    Response.transform(Connection.send(conn, hd(statements), params))
-  end
+  def begin(), do: "BEGIN"
+  def commit(), do: "COMMIT"
+  def rollback(), do: "ROLLBACK"
 
-  defp tx(conn, statements, params) do
-    try do
-      Transaction.begin(conn)
-      responses = Enum.reduce(statements, [], &(send!(conn, &1, params, &2)))
-      Transaction.commit(conn)
-      responses
-    rescue
-      e in RuntimeError ->
-        Transaction.rollback(conn)
-        {:error, e}
-    end
-  end
-
-  defp send!(conn, statement, params, acc) do
-    r = Connection.send(conn, statement, params)
-    # IO.puts("\n#{inspect __MODULE__}.send!/4:\nC: #{inspect statement}\nS: #{inspect r}")
-    case r do
-      {:error, error} -> raise RuntimeError, error
-      _ -> acc ++ [Response.transform(r)]
-    end
-  end
 end
