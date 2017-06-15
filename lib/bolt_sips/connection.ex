@@ -3,6 +3,10 @@ defmodule Bolt.Sips.Connection do
   This module handles the connection to Neo4j, providing support
   for queries, transactions, logging, pooling and more.
 
+  NOTE: The use of Poolboy is not correctly implemented and currently
+  doesn't work as a pool. Instead it opens a new connection for every
+  call to conn/0 and the connection is never closed.
+
   Do not use this module directly. Use the `Bolt.Sips.conn` instead
   """
   defstruct [:opts]
