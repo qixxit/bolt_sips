@@ -283,7 +283,7 @@ defmodule Bolt.Sips do
   defp handle_query_result!({:error, f}) do
     raise Bolt.Sips.Exception, code: f.code, message: f.message
   end
-  defp handle_query_result!(result), do: result
+  defp handle_query_result(result), do: result
 
   defp handle_query_result({:error, f}) do
     {:error, code: f.code, message: f.message}
