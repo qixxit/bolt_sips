@@ -7,6 +7,9 @@ defmodule Bolt.Sips do
   @timeout   15_000
   # @max_rows     500
 
+  #FIXME: this is for debugging only
+  require Logger
+
  alias Bolt.Sips.{Query, Response, Utils}
 
   @doc """
@@ -103,18 +106,17 @@ defmodule Bolt.Sips do
   in this transaction will fail immediately.
   """
   @spec rollback(pid) :: :ok
-  def rollback(worker_pid) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, Query.rollback)
-    :poolboy.checkin(Bolt.Sips.pool_name, worker_pid)
+  def rollback(tx_pid) when is_pid(tx_pid) do
+    run_transaction_query(tx_pid, Query.rollback)
   end
 
   @doc """
   given you have an open transaction, you can use this to send a commit request
   """
   @spec commit(pid) :: :ok
-  def commit(worker_pid) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, Query.commit)
-    :poolboy.checkin(Bolt.Sips.pool_name, worker_pid)
+  def commit(tx_pid) when is_pid(tx_pid) do
+    execute_query(tx_pid, Query.commit, %{})
+    :poolboy.checkin(Bolt.Sips.pool_name, tx_pid)
   end
 
   @doc """
@@ -122,8 +124,8 @@ defmodule Bolt.Sips do
   `{:error, error}` otherwise
   """
   @spec query(pid, String.t) :: {:ok, Bolt.Sips.Response} | {:error, Bolt.Sips.Error}
-  def query(worker_pid, statement) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, statement) |> handle_query_result
+  def query(tx_pid, statement) when is_pid(tx_pid) do
+    run_transaction_query(tx_pid, statement) |> handle_query_result
   end
 
   @doc """
@@ -131,24 +133,24 @@ defmodule Bolt.Sips do
   Returns the server response otherwise.
   """
   @spec query!(pid, String.t) :: Bolt.Sips.Response | Bolt.Sips.Exception
-  def query!(worker_pid, statement) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, statement) |> handle_query_result!
+  def query!(tx_pid, statement) when is_pid(tx_pid) do
+    run_transaction_query(tx_pid, statement) |> handle_query_result!
   end
 
   @doc """
   send a query and an associated map of parameters. Returns the server response or an error
   """
   @spec query(pid, String.t, Map.t) :: {:ok, Bolt.Sips.Response} | {:error, Bolt.Sips.Error}
-  def query(worker_pid, statement, params) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, statement, params) |> handle_query_result
+  def query(tx_pid, statement, params) when is_pid(tx_pid) do
+    run_transaction_query(tx_pid, statement, params) |> handle_query_result
   end
 
   @doc """
   The same as query/3 but raises a Bolt.Sips.Exception if it fails.
   """
   @spec query!(pid, String.t, Map.t) :: Bolt.Sips.Response | Bolt.Sips.Exception
-  def query!(worker_pid, statement, params) when is_pid(worker_pid) do
-    run_transaction_query(worker_pid, statement, params) |> handle_query_result!
+  def query!(tx_pid, statement, params) when is_pid(tx_pid) do
+    run_transaction_query(tx_pid, statement, params) |> handle_query_result!
   end
 
   ## Query
@@ -221,69 +223,69 @@ defmodule Bolt.Sips do
 
   #TODO: this has to be refactored into more readable form
   defp run_transaction(statement, params) do
-      case Query.parse_statements(statement) do
-        [statement] ->
-          :poolboy.transaction(
-            Bolt.Sips.pool_name,
-            &(:gen_server.call(&1, {statement, params}, Bolt.Sips.config(:timeout))),
-            :infinity
-          )
-        statements ->
-          worker_pid = begin()
-          try do
-            responses = Enum.reduce(statements, [], &(run_query!(worker_pid, &1, params, &2)))
-            :ok = commit(worker_pid)
-            responses
-          rescue
-            e in RuntimeError ->
-              :ok = rollback(worker_pid)
-            {:error, e}
-          end
-      end
+    case Query.parse_statements(statement) do
+      [statement] ->
+        Logger.debug "run_transaction(single): statement=#{inspect statement}"
+        Response.transform(execute_query(statement, params))
+      statements ->
+        Logger.debug "run_transaction(multiple): statement=#{inspect statements}"
+        tx_pid = begin()
+        response = run_transaction(tx_pid, statements, params)
+        :ok = commit(tx_pid)
+        response
+    end
   end
 
-  defp run_transaction(worker_pid, statement, params) do
+  defp run_transaction(tx_pid, statement, params) do
     try do
       statements = Query.parse_statements(statement)
-      worker_pid = begin(worker_pid)
-      responses = Enum.reduce(statements, [], &(run_transaction!(worker_pid, &1, params, &2)))
-      :ok = commit(worker_pid)
-      responses
+      Logger.debug "run_transaction(tx): statements=#{inspect statements}"
+      Enum.reduce(statements, [], &(run_query!(tx_pid, &1, params, &2)))
     rescue
       e in RuntimeError ->
-        :ok = rollback(worker_pid)
+        :ok = rollback(tx_pid)
       {:error, e}
     end
   end
 
-  defp run_query!(worker_pid, statement, params, acc) do
-    case execute_query(worker_pid, statement, params) do
+  defp run_query!(tx_pid, statement, params, acc) do
+    Logger.debug "tx.run_query!: statement=#{inspect statement}, acc=#{inspect acc}"
+    case execute_query(tx_pid, statement, params) do
       {:error, error} -> raise RuntimeError, error
       r -> acc ++ [Response.transform(r)]
     end
   end
 
-  defp begin(worker_pid) do
-    run_transaction_query(worker_pid, Query.begin)
-    worker_pid
+  defp begin(tx_pid) do
+    execute_query(tx_pid, Query.begin, %{})
+    tx_pid
   end
 
-  defp execute_query(worker_pid, statement, params) do
-    :gen_server.call(worker_pid, {statement, params}, Bolt.Sips.config(:timeout))
+  defp execute_query(tx_pid, statement, params) do
+    :gen_server.call(tx_pid, {statement, params}, Bolt.Sips.config(:timeout))
   end
 
-  defp run_transaction_query(worker_pid, statement) do
-    run_transaction_query(worker_pid, statement, %{})
+  defp execute_query(statement, params) do
+    :poolboy.transaction(
+      Bolt.Sips.pool_name,
+      &(:gen_server.call(&1, {statement, params}, Bolt.Sips.config(:timeout))),
+      :infinity
+    )
   end
 
-  defp run_transaction_query(worker_pid, statement, params) do
-    :gen_server.call(worker_pid, {statement, params}, Bolt.Sips.config(:timeout))
+  defp run_transaction_query(tx_pid, statement) do
+    run_transaction_query(tx_pid, statement, %{})
+  end
+
+  defp run_transaction_query(tx_pid, statement, params) do
+    #:gen_server.call(tx_pid, {statement, params}, Bolt.Sips.config(:timeout))
+    run_transaction(tx_pid, statement, params)
   end
 
   defp handle_query_result!({:error, f}) do
     raise Bolt.Sips.Exception, code: f.code, message: f.message
   end
-  defp handle_query_result(result), do: result
+  defp handle_query_result!(result), do: result
 
   defp handle_query_result({:error, f}) do
     {:error, code: f.code, message: f.message}

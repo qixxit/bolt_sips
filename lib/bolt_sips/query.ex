@@ -49,8 +49,8 @@ defmodule Bolt.Sips.Query do
 
   @cypher_seps ~r/;(.){0,1}\n/
 
-  def parse_statements([statement]) do
-    statement
+  def parse_statements(statements) when is_list(statements) do
+    statements
   end
   def parse_statements(statements) do
     String.split(statements, @cypher_seps, trim: true)

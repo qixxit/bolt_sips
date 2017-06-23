@@ -34,7 +34,7 @@ defmodule Bolt.Sips.Connection do
           r =
             Boltex.Bolt.run_statement(Bolt.Sips.config(:socket), state.conn, statement, params, boltex_opts())
             |> maybe_ack_failure(Bolt.Sips.config(:socket), state.conn)
-          log("[#{inspect state.conn}] cypher: #{inspect statement} - params: #{inspect params} - bolt: #{inspect r}")
+          log("[#{inspect state.conn}] cyphr: #{inspect statement} - params: #{inspect params} - bolt: #{inspect r}")
           r
         rescue e ->
           Boltex.Bolt.ack_failure(Bolt.Sips.config(:socket), state.conn, boltex_opts())
